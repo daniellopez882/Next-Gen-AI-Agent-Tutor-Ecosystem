@@ -46,3 +46,8 @@ share/python-wheels/
 *.egg-info/
 .installed.cfg
 *.egg
+
+# Tooling
+.venv312/
+.pytest_cache/
+.ruff_cache/
