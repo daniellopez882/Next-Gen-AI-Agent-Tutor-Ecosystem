@@ -1,82 +1,134 @@
-import os
-import chromadb
-from chromadb.config import Settings
+"""
+Retrieval over the curriculum vector store.
 
-# Setup a local directory for the Vector Database storage
-DB_PATH = os.path.join(os.path.dirname(__file__), "chroma_db")
+The previous module was the repository's clearest case of a claim the code did
+not keep. It built a real ChromaDB persistent client, seeded it with four
+documents and their embeddings -- and then ``retrieve_context`` **ignored the
+vector store entirely** and did substring keyword matching over a hardcoded
+copy of the same four sentences:
 
-# Initialize persistent ChromaDB client
-client = chromadb.PersistentClient(path=DB_PATH)
-
-# Get or create our Curriculum knowledge collection
-collection = client.get_or_create_collection(
-    name="tutor_curriculum",
-    metadata={"hnsw:space": "cosine"}
-)
-
-def seed_database():
-    """Seeds the vector database with initial educational content if empty."""
-    if collection.count() == 0:
-        print("Seeding initial curriculum knowledge into local Vector DB...")
-        documents = [
-            "Photosynthesis is the process by which green plants and some other organisms use sunlight to synthesize nutrients from carbon dioxide and water. In plants, photosynthesis generally involves the green pigment chlorophyll and generates oxygen as a byproduct.",
-            "A fraction represents a part of a whole or, more generally, any number of equal parts. It is written as a numerator over a denominator. Example: 3/4 means three parts out of four total equal parts.",
-            "The Solar System is the gravitationally bound system of the Sun and the objects that orbit it. It contains eight planets: Mercury, Venus, Earth, Mars, Jupiter, Saturn, Uranus, and Neptune in order from the Sun.",
-            "Newton's First Law of Motion states that an object will remain at rest or in uniform motion in a straight line unless acted upon by an external force. This is also known as the law of inertia."
-        ]
-        
-        metadatas = [
-            {"subject": "Biology", "topic": "Photosynthesis", "grade": "6-8"},
-            {"subject": "Mathematics", "topic": "Fractions", "grade": "3-5"},
-            {"subject": "Science", "topic": "Astronomy", "grade": "6-8"},
-            {"subject": "Physics", "topic": "Classical Mechanics", "grade": "9-12"}
-        ]
-        
-        ids = [f"curr_{i}" for i in range(len(documents))]
-        
-        # Add to collection (this automatically embeds using the default local ONNX model)
-        collection.add(
-            documents=documents,
-            metadatas=metadatas,
-            ids=ids
-        )
-        print(f"Successfully seeded {len(documents)} curriculum chunks into ChromaDB!")
-
-# Run seed check on import
-seed_database()
-
-def retrieve_context(query: str, n_results: int = 2) -> list[str]:
-    """Search the vector database for relevant curriculum context."""
-    # Since ONNX inference is sometimes unstable on certain Windows environments,
-    # we use a highly reliable keyword-based RAG fallback for the local prototype.
-    query_lower = query.lower()
-    
-    fallback_docs = [
-        "Photosynthesis is the process by which green plants and some other organisms use sunlight to synthesize nutrients from carbon dioxide and water. In plants, photosynthesis generally involves the green pigment chlorophyll and generates oxygen as a byproduct.",
-        "A fraction represents a part of a whole or, more generally, any number of equal parts. It is written as a numerator over a denominator. Example: 3/4 means three parts out of four total equal parts.",
-        "The Solar System is the gravitationally bound system of the Sun and the objects that orbit it. It contains eight planets: Mercury, Venus, Earth, Mars, Jupiter, Saturn, Uranus, and Neptune in order from the Sun.",
-        "Newton's First Law of Motion states that an object will remain at rest or in uniform motion in a straight line unless acted upon by an external force. This is also known as the law of inertia."
-    ]
-    
-    matched = []
-    
-    # Simple simulated retrieval
+    # Since ONNX inference is sometimes unstable on certain Windows
+    # environments, we use a highly reliable keyword-based RAG fallback ...
     if "photosynthesis" in query_lower or "plant" in query_lower:
         matched.append(fallback_docs[0])
-    if "fraction" in query_lower or "math" in query_lower:
-        matched.append(fallback_docs[1])
-    if "solar" in query_lower or "planet" in query_lower or "space" in query_lower:
-        matched.append(fallback_docs[2])
-    if "newton" in query_lower or "gravity" in query_lower or "physics" in query_lower:
-        matched.append(fallback_docs[3])
-        
-    if matched:
-        return matched[:n_results]
-        
-    return ["No exact curriculum context found in the knowledge base."]
 
-if __name__ == "__main__":
-    # Test query
-    sample_q = "Tell me about planets"
-    res = retrieve_context(sample_q, 1)
-    print(f"\nQuery: '{sample_q}'\nRetrieved: {res[0]}")
+So the "vector database" was seeded and never queried; the retrieval was
+`"math" in query`, which also matches "aftermath". The README advertised
+"Full RAG".
+
+This module actually queries ChromaDB. Keyword matching remains, but only as
+an explicit, labelled fallback for when the embedding backend is genuinely
+unavailable -- and ``retrieve_context`` reports which path answered. Nothing
+runs at import: the client and the seed are created on first use.
+"""
+
+from __future__ import annotations
+
+import logging
+from dataclasses import dataclass
+from functools import lru_cache
+from typing import Any
+
+from config import settings
+
+logger = logging.getLogger("lumina.rag")
+
+COLLECTION = "tutor_curriculum"
+
+SEED_DOCUMENTS = [
+    (
+        "Photosynthesis is the process by which green plants and some other organisms use "
+        "sunlight to synthesize nutrients from carbon dioxide and water, using the green "
+        "pigment chlorophyll and generating oxygen as a byproduct.",
+        {"subject": "Biology", "topic": "Photosynthesis", "grade": "6-8"},
+    ),
+    (
+        "A fraction represents a part of a whole or any number of equal parts, written as a "
+        "numerator over a denominator. 3/4 means three parts out of four equal parts.",
+        {"subject": "Mathematics", "topic": "Fractions", "grade": "3-5"},
+    ),
+    (
+        "The Solar System is the gravitationally bound system of the Sun and the objects that "
+        "orbit it, including eight planets: Mercury, Venus, Earth, Mars, Jupiter, Saturn, "
+        "Uranus and Neptune.",
+        {"subject": "Science", "topic": "Astronomy", "grade": "6-8"},
+    ),
+    (
+        "Newton's First Law of Motion states that an object remains at rest or in uniform "
+        "motion in a straight line unless acted upon by an external force -- the law of inertia.",
+        {"subject": "Physics", "topic": "Classical Mechanics", "grade": "9-12"},
+    ),
+]
+
+# Keyword -> seed index, for the fallback only.
+_KEYWORDS = {
+    0: ("photosynthesis", "chlorophyll", "plant"),
+    1: ("fraction", "numerator", "denominator"),
+    2: ("solar system", "planet", "astronomy", "orbit"),
+    3: ("newton", "inertia", "motion", "force"),
+}
+
+
+@dataclass(frozen=True)
+class Retrieval:
+    documents: list[str]
+    source: str  # "vector" | "keyword-fallback" | "empty"
+
+
+@lru_cache(maxsize=1)
+def _collection() -> Any:
+    """The ChromaDB collection, created and seeded once, on first use."""
+    import chromadb
+
+    client = chromadb.PersistentClient(path=settings.CHROMA_PATH)
+    collection = client.get_or_create_collection(
+        name=COLLECTION, metadata={"hnsw:space": "cosine"}
+    )
+    if collection.count() == 0:
+        collection.add(
+            documents=[doc for doc, _ in SEED_DOCUMENTS],
+            metadatas=[meta for _, meta in SEED_DOCUMENTS],
+            ids=[f"curr_{i}" for i in range(len(SEED_DOCUMENTS))],
+        )
+        logger.info(
+            "seeded %d curriculum chunks into ChromaDB at %s",
+            len(SEED_DOCUMENTS),
+            settings.CHROMA_PATH,
+        )
+    return collection
+
+
+def _keyword_fallback(query: str, n_results: int) -> list[str]:
+    lowered = query.lower()
+    hits = [
+        SEED_DOCUMENTS[i][0]
+        for i, words in _KEYWORDS.items()
+        if any(w in lowered for w in words)
+    ]
+    return hits[:n_results]
+
+
+def retrieve(query: str, n_results: int = 2) -> Retrieval:
+    """
+    Query the vector store. Falls back to keyword matching only if the
+    embedding backend raises, and says which path answered.
+    """
+    if not query or not query.strip():
+        return Retrieval([], "empty")
+    try:
+        result = _collection().query(query_texts=[query], n_results=n_results)
+        documents = (result.get("documents") or [[]])[0]
+        if documents:
+            return Retrieval(list(documents), "vector")
+    except Exception:
+        logger.warning("vector query failed; using the keyword fallback", exc_info=True)
+        fallback = _keyword_fallback(query, n_results)
+        if fallback:
+            return Retrieval(fallback, "keyword-fallback")
+    return Retrieval([], "empty")
+
+
+def retrieve_context(query: str, n_results: int = 2) -> list[str]:
+    """Documents only, for callers that do not need the source. Kept for the old name."""
+    hits = retrieve(query, n_results).documents
+    return hits or ["No curriculum context matched this query."]
