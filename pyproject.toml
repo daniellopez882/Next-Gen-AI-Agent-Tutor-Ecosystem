@@ -1,0 +1,11 @@
+# This file was committed empty, so pytest and ruff ran entirely on their
+# defaults: the working directory was not on sys.path, which is why the suite
+# passed under `python -m pytest` locally and failed to import `database` under
+# the plain `pytest` that CI runs.
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"
+# `pytest` does not add the working directory to sys.path the way
+# `python -m pytest` does; the modules under test live at the repository root.
+pythonpath = ["."]
