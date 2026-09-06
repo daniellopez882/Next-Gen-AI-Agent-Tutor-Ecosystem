@@ -1,188 +1,174 @@
-import json
-from typing import Dict, Any, List, Optional
-from langgraph.graph import StateGraph, END
-from pydantic import BaseModel
+"""
+The LangGraph workflow: an orchestrator that classifies a task and routes it
+to one of five specialists.
 
-from llm_config import get_orchestrator_llm, get_reasoning_llm
+Changes:
+
+* The orchestrator, progress and parent nodes each did their own
+  ``.replace('```json','')`` + ``json.loads``; all three go through the one
+  extractor now, so a reply with prose around its JSON no longer silently
+  falls back to the doubt resolver.
+* Models come from ``llm`` (the seam the tests use), not from three copies of
+  a hardcoded-model factory.
+* The graph is built once via ``get_graph()`` rather than at import, so
+  importing this module does not require a model provider.
+* ``route_task`` returns a node that is always in the conditional-edge map;
+  an unrecognised classification maps to the doubt resolver rather than
+  raising inside LangGraph.
+"""
+
+from __future__ import annotations
+
+import logging
+from functools import lru_cache
+from typing import Any, TypedDict
+
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import END, StateGraph
+
+import rag_pipeline
+from crew_agents import run_doubt_resolver, run_lesson_personalizer, run_quiz_generator
 from education_tutor_prompts import (
     ORCHESTRATOR_PROMPT,
-    PROGRESS_TRACKER_PROMPT,
     PARENT_REPORTER_PROMPT,
-    build_agent_prompt_with_student
+    PROGRESS_TRACKER_PROMPT,
+    build_agent_prompt_with_student,
 )
-from crew_agents import run_lesson_personalizer, run_quiz_generator, run_doubt_resolver
-from langchain_core.messages import SystemMessage, HumanMessage
-import rag_pipeline
+from json_extraction import extract_json
+from llm import get_langchain_model
 
-# ---- State Definition ----
-class TutorState(Dict[str, Any]):
+logger = logging.getLogger("lumina.graph")
+
+SPECIALISTS = (
+    "lesson_personalizer",
+    "quiz_generator",
+    "doubt_resolver",
+    "progress_tracker",
+    "parent_reporter",
+)
+FALLBACK = "doubt_resolver"
+
+# substring in the model's task_type -> node
+TASK_TYPE_TO_NODE = {
+    "lesson": "lesson_personalizer",
+    "quiz": "quiz_generator",
+    "progress": "progress_tracker",
+    "report": "parent_reporter",
+    "doubt": "doubt_resolver",
+}
+
+
+class TutorState(TypedDict, total=False):
     task_input: str
-    student_profile: Dict[str, Any]
-    classification: Optional[Dict[str, Any]]
-    final_response: Optional[Dict[str, Any]]
+    student_profile: dict[str, Any]
+    classification: dict[str, Any]
+    final_response: dict[str, Any]
 
-# ---- Nodes ----
-def orchestrator_node(state: TutorState) -> TutorState:
-    """
-    Classifies the task and routes to the appropriate specialist agent.
-    """
+
+def _classify(task_type: str) -> str:
+    for needle, node in TASK_TYPE_TO_NODE.items():
+        if needle in (task_type or "").lower():
+            return node
+    return FALLBACK
+
+
+def orchestrator_node(state: TutorState) -> dict:
     task = state.get("task_input", "")
-    profile = state.get("student_profile", {})
-    
-    llm = get_orchestrator_llm()
     messages = [
         SystemMessage(content=ORCHESTRATOR_PROMPT),
-        HumanMessage(content=f"Classify this incoming task and return exactly the required JSON format: '{task}'")
+        HumanMessage(
+            content=f"Classify this task and return the required JSON: '{task}'"
+        ),
     ]
-    
     try:
-        response = llm.invoke(messages)
-        clean_json = response.content.replace('```json', '').replace('```', '').strip()
-        classification = json.loads(clean_json)
-        
-        # Determine the next agent based on task type. Map to valid graph nodes.
-        task_type = classification.get("task_type", "doubt")
-        next_agent = "doubt_resolver" # fallback
-        if "lesson" in task_type:
-            next_agent = "lesson_personalizer"
-        elif "quiz" in task_type:
-            next_agent = "quiz_generator"
-        elif "progress" in task_type:
-            next_agent = "progress_tracker"
-        elif "report" in task_type:
-            next_agent = "parent_reporter"
-        elif "doubt" in task_type:
-            next_agent = "doubt_resolver"
-        
-        classification["next_agent"] = next_agent
-        state["classification"] = classification
-    except Exception as e:
-        print(f"Orchestrator Parsing Error: {e}")
-        state["classification"] = {"next_agent": "doubt_resolver"} # Fallback
+        reply = get_langchain_model("orchestrator").invoke(messages)
+        classification = extract_json(getattr(reply, "content", "") or "")
+    except Exception:
+        logger.exception("orchestrator failed; routing to the doubt resolver")
+        classification = {}
+    classification["next_agent"] = _classify(str(classification.get("task_type", "")))
+    return {"classification": classification}
 
-    return state
 
-def lesson_personalizer_node(state: TutorState) -> TutorState:
-    profile = state.get("student_profile", {})
+def lesson_personalizer_node(state: TutorState) -> dict:
+    output = run_lesson_personalizer(
+        state.get("student_profile", {}), state.get("task_input", "")
+    )
+    return {"final_response": {"agent": "LessonPersonalizer", "output": output}}
+
+
+def quiz_generator_node(state: TutorState) -> dict:
+    output = run_quiz_generator(
+        state.get("student_profile", {}), state.get("task_input", "")
+    )
+    return {"final_response": {"agent": "QuizGenerator", "output": output}}
+
+
+def doubt_resolver_node(state: TutorState) -> dict:
     task = state.get("task_input", "")
-    result = run_lesson_personalizer(profile, task)
-    state["final_response"] = {
-        "agent": "LessonPersonalizer",
-        "output": result
+    retrieval = rag_pipeline.retrieve(task, n_results=2)
+    output = run_doubt_resolver(
+        state.get("student_profile", {}), task, retrieval.documents
+    )
+    return {
+        "final_response": {
+            "agent": "DoubtResolver",
+            "output": output,
+            "rag_context_used": retrieval.documents,
+            "rag_source": retrieval.source,
+        }
     }
-    return state
 
-def quiz_generator_node(state: TutorState) -> TutorState:
+
+def _reasoning_node(state: TutorState, prompt: str, agent_name: str) -> dict:
     profile = state.get("student_profile", {})
     task = state.get("task_input", "")
-    result = run_quiz_generator(profile, task)
-    state["final_response"] = {
-        "agent": "QuizGenerator",
-        "output": result
-    }
-    return state
-
-def doubt_resolver_node(state: TutorState) -> TutorState:
-    profile = state.get("student_profile", {})
-    task = state.get("task_input", "")
-    
-    # Retrieve dynamic, real curriculum context from our Vector Database
-    retrieved_context = rag_pipeline.retrieve_context(task, n_results=2)
-    
-    result = run_doubt_resolver(profile, task, retrieved_context)
-    state["final_response"] = {
-        "agent": "DoubtResolver",
-        "output": result,
-        "rag_context_used": retrieved_context
-    }
-    return state
-
-def progress_tracker_node(state: TutorState) -> TutorState:
-    profile = state.get("student_profile", {})
-    task = state.get("task_input", "")
-    llm = get_reasoning_llm()
-    prompt = build_agent_prompt_with_student(PROGRESS_TRACKER_PROMPT, profile)
-    
     messages = [
-        SystemMessage(content=prompt),
-        HumanMessage(content=f"Process this progress request and return the structured JSON: '{task}'")
+        SystemMessage(content=build_agent_prompt_with_student(prompt, profile)),
+        HumanMessage(
+            content=f"Process this request and return the structured JSON: '{task}'"
+        ),
     ]
     try:
-        response = llm.invoke(messages)
-        clean_json = response.content.replace('```json', '').replace('```', '').strip()
-        result = json.loads(clean_json)
-    except Exception as e:
-        result = {"error": "Progress parsing error", "details": str(e)}
+        reply = get_langchain_model("reasoning").invoke(messages)
+        output = extract_json(getattr(reply, "content", "") or "")
+    except Exception as error:
+        logger.exception("%s failed", agent_name)
+        output = {"error": f"{agent_name} failed", "details": type(error).__name__}
+    return {"final_response": {"agent": agent_name, "output": output}}
 
-    state["final_response"] = {
-        "agent": "ProgressTracker",
-        "output": result
-    }
-    return state
 
-def parent_reporter_node(state: TutorState) -> TutorState:
-    profile = state.get("student_profile", {})
-    task = state.get("task_input", "")
-    llm = get_reasoning_llm()
-    prompt = build_agent_prompt_with_student(PARENT_REPORTER_PROMPT, profile)
-    
-    messages = [
-        SystemMessage(content=prompt),
-        HumanMessage(content=f"Generate a parent report based on this request and return JSON: '{task}'")
-    ]
-    try:
-        response = llm.invoke(messages)
-        clean_json = response.content.replace('```json', '').replace('```', '').strip()
-        result = json.loads(clean_json)
-    except Exception as e:
-        result = {"error": "Parent report parsing error", "details": str(e)}
+def progress_tracker_node(state: TutorState) -> dict:
+    return _reasoning_node(state, PROGRESS_TRACKER_PROMPT, "ProgressTracker")
 
-    state["final_response"] = {
-        "agent": "ParentReporter",
-        "output": result
-    }
-    return state
 
-# ---- Routing Logic ----
+def parent_reporter_node(state: TutorState) -> dict:
+    return _reasoning_node(state, PARENT_REPORTER_PROMPT, "ParentReporter")
+
+
 def route_task(state: TutorState) -> str:
-    classification = state.get("classification", {})
-    return classification.get("next_agent", "doubt_resolver")
+    node = state.get("classification", {}).get("next_agent", FALLBACK)
+    return node if node in SPECIALISTS else FALLBACK
 
-# ---- Graph Construction ----
-def build_tutor_graph():
+
+def build_graph():
     workflow = StateGraph(TutorState)
-    
-    # Add nodes
     workflow.add_node("orchestrator", orchestrator_node)
     workflow.add_node("lesson_personalizer", lesson_personalizer_node)
     workflow.add_node("quiz_generator", quiz_generator_node)
     workflow.add_node("doubt_resolver", doubt_resolver_node)
     workflow.add_node("progress_tracker", progress_tracker_node)
     workflow.add_node("parent_reporter", parent_reporter_node)
-    
-    # Set entry point
+
     workflow.set_entry_point("orchestrator")
-    
-    # Conditional Edges from orchestrator to defined agents
     workflow.add_conditional_edges(
-        "orchestrator",
-        route_task,
-        {
-            "lesson_personalizer": "lesson_personalizer",
-            "quiz_generator": "quiz_generator",
-            "doubt_resolver": "doubt_resolver",
-            "progress_tracker": "progress_tracker",
-            "parent_reporter": "parent_reporter"
-        }
+        "orchestrator", route_task, {name: name for name in SPECIALISTS}
     )
-    
-    # All specialists return to END
-    workflow.add_edge("lesson_personalizer", END)
-    workflow.add_edge("quiz_generator", END)
-    workflow.add_edge("doubt_resolver", END)
-    workflow.add_edge("progress_tracker", END)
-    workflow.add_edge("parent_reporter", END)
-    
+    for name in SPECIALISTS:
+        workflow.add_edge(name, END)
     return workflow.compile()
 
-tutor_graph = build_tutor_graph()
+
+@lru_cache(maxsize=1)
+def get_graph():
+    return build_graph()

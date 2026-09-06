@@ -1183,6 +1183,7 @@ ERROR HANDLING:
 # HELPER FUNCTIONS
 # ============================================================
 
+
 def build_agent_prompt(base_prompt: str, include_guardrails: bool = True) -> str:
     """
     Combine agent prompt with universal educational guardrails.
@@ -1197,9 +1198,7 @@ def build_agent_prompt(base_prompt: str, include_guardrails: bool = True) -> str
 
 
 def build_agent_prompt_with_student(
-    base_prompt: str,
-    student_profile: dict,
-    include_guardrails: bool = True
+    base_prompt: str, student_profile: dict, include_guardrails: bool = True
 ) -> str:
     """
     Inject student profile into any agent prompt dynamically.
@@ -1223,16 +1222,16 @@ def build_agent_prompt_with_student(
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ACTIVE STUDENT PROFILE
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-Student ID:       {student_profile.get('student_id', 'N/A')}
-Name:             {student_profile.get('name', 'Student')}
-Grade Level:      {student_profile.get('grade_level', 'N/A')}
-Age:              {student_profile.get('age', 'N/A')}
-Learning Style:   {student_profile.get('learning_style', 'reading')}
-Interests:        {', '.join(student_profile.get('interests', []))}
-Language:         {student_profile.get('language', 'English')}
-Accommodations:   {', '.join(student_profile.get('accommodations', [])) or 'None'}
-Active Subject:   {student_profile.get('active_subject', 'N/A')}
-Mastery Levels:   {student_profile.get('mastery_levels', {{}})}
+Student ID:       {student_profile.get("student_id", "N/A")}
+Name:             {student_profile.get("name", "Student")}
+Grade Level:      {student_profile.get("grade_level", "N/A")}
+Age:              {student_profile.get("age", "N/A")}
+Learning Style:   {student_profile.get("learning_style", "reading")}
+Interests:        {", ".join(student_profile.get("interests", []))}
+Language:         {student_profile.get("language", "English")}
+Accommodations:   {", ".join(student_profile.get("accommodations", [])) or "None"}
+Active Subject:   {student_profile.get("active_subject", "N/A")}
+Mastery Levels:   {student_profile.get("mastery_levels", {{}})}
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 """
     full_prompt = base_prompt.strip() + "\n\n" + student_context
@@ -1246,11 +1245,11 @@ Mastery Levels:   {student_profile.get('mastery_levels', {{}})}
 # ============================================================
 
 ALL_PROMPTS = {
-    "orchestrator":          ORCHESTRATOR_PROMPT,
-    "lesson_personalizer":   LESSON_PERSONALIZER_PROMPT,
-    "quiz_generator":        QUIZ_GENERATOR_PROMPT,
-    "progress_tracker":      PROGRESS_TRACKER_PROMPT,
-    "doubt_resolver":        DOUBT_RESOLVER_PROMPT,
-    "parent_reporter":       PARENT_REPORTER_PROMPT,
-    "guardrails":            GUARDRAILS_PROMPT,
+    "orchestrator": ORCHESTRATOR_PROMPT,
+    "lesson_personalizer": LESSON_PERSONALIZER_PROMPT,
+    "quiz_generator": QUIZ_GENERATOR_PROMPT,
+    "progress_tracker": PROGRESS_TRACKER_PROMPT,
+    "doubt_resolver": DOUBT_RESOLVER_PROMPT,
+    "parent_reporter": PARENT_REPORTER_PROMPT,
+    "guardrails": GUARDRAILS_PROMPT,
 }

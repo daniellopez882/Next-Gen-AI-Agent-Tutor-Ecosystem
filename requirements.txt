@@ -1,12 +1,18 @@
-fastapi
-uvicorn
-langgraph
-langchain
-langchain-core
-langchain-openai
-langchain-anthropic
-crewai
-python-dotenv
-pydantic
-mcp
-chromadb
+# Pinned to the versions this repository is tested against (Python 3.11-3.13;
+# crewai declares <3.14).
+#
+# The previous file listed twelve bare names. The bare `langchain` meta-package
+# is dropped: nothing imports it (the code uses langchain-core, -openai and
+# -anthropic directly).
+fastapi==0.141.1
+uvicorn[standard]==0.52.4
+langgraph==1.2.11
+langchain-core==1.6.2
+langchain-openai==1.6.0
+langchain-anthropic==1.7.1
+crewai==1.15.20
+mcp==1.28.1
+chromadb==1.1.1
+pydantic==2.12.5
+pydantic-settings==2.15.0
+python-dotenv==1.2.3

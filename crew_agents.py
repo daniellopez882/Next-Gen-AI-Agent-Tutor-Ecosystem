@@ -1,105 +1,82 @@
-import json
-from crewai import Agent, Task, Crew, Process
-from llm_config import get_creative_llm, get_reasoning_llm
+"""
+The three crewai specialist agents.
+
+Each built a crewai ``Agent`` with a LangChain model and did its own
+``.replace('```json', '')`` + ``json.loads`` on the result. The model comes
+from ``llm.get_crew_llm`` now (crewai's own LLM with an explicit key), and the
+parsing goes through the one extractor in ``json_extraction``.
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
 from education_tutor_prompts import (
+    DOUBT_RESOLVER_PROMPT,
     LESSON_PERSONALIZER_PROMPT,
     QUIZ_GENERATOR_PROMPT,
-    DOUBT_RESOLVER_PROMPT,
-    build_agent_prompt_with_student
+    build_agent_prompt_with_student,
 )
-
-def run_lesson_personalizer(student_profile: dict, task_input: str) -> dict:
-    llm = get_creative_llm()
-    prompt = build_agent_prompt_with_student(LESSON_PERSONALIZER_PROMPT, student_profile)
-
-    agent = Agent(
-        role="Lesson Personalizer",
-        goal="Design and deliver personalized lesson experiences tailored to the student's unique learning profile.",
-        backstory=prompt,
-        verbose=True,
-        allow_delegation=False,
-        llm=llm
-    )
-
-    task = Task(
-        description=f"Create a personalized lesson for the following request: '{task_input}'. Ensure you follow the adaptive lesson design protocol and return the exact JSON structure defined in your instructions without markdown wrapping or extra text.",
-        expected_output="A JSON object matching the exact format specified in the OUTPUT FORMAT section.",
-        agent=agent
-    )
-
-    crew = Crew(
-        agents=[agent],
-        tasks=[task],
-        process=Process.sequential,
-        verbose=True
-    )
-
-    result_str = crew.kickoff()
-    try:
-        # Strip potential markdown formatting that LLMs sometimes add (e.g. ```json )
-        clean_json = str(result_str).replace('```json', '').replace('```', '').strip()
-        return json.loads(clean_json)
-    except Exception as e:
-        return {"error": "Failed to parse JSON", "raw_output": str(result_str), "details": str(e)}
+from json_extraction import extract_json
+from llm import get_crew_llm
 
 
-def run_quiz_generator(student_profile: dict, task_input: str) -> dict:
-    llm = get_reasoning_llm()
-    prompt = build_agent_prompt_with_student(QUIZ_GENERATOR_PROMPT, student_profile)
+def _run_agent(
+    role: str, goal: str, prompt: str, description: str, llm_role: str
+) -> dict:
+    from crewai import Agent, Crew, Process, Task
 
     agent = Agent(
-        role="Quiz Generator",
-        goal="Create topic-based quizzes, practice sets, and formal assessments that measure mastery and identify misconceptions.",
+        role=role,
+        goal=goal,
         backstory=prompt,
-        verbose=True,
+        verbose=False,
         allow_delegation=False,
-        llm=llm
+        llm=get_crew_llm(llm_role),
     )
-
     task = Task(
-        description=f"Generate a quiz based on the request: '{task_input}'. Ensure you strictly follow the Bloom's Taxonomy standards and return the exact JSON structure defined in your instructions without markdown block wrappers.",
-        expected_output="A valid JSON object.",
-        agent=agent
+        description=description,
+        expected_output="A single JSON object matching the OUTPUT FORMAT in the instructions, no markdown fences.",
+        agent=agent,
+    )
+    result = Crew(
+        agents=[agent], tasks=[task], process=Process.sequential, verbose=False
+    ).kickoff()
+    return extract_json(str(getattr(result, "raw", result)))
+
+
+def run_lesson_personalizer(student_profile: dict, task_input: str) -> dict[str, Any]:
+    return _run_agent(
+        "Lesson Personalizer",
+        "Design a personalized lesson for the student's profile.",
+        build_agent_prompt_with_student(LESSON_PERSONALIZER_PROMPT, student_profile),
+        f"Create a personalized lesson for this request: '{task_input}'. Follow the adaptive lesson protocol.",
+        "creative",
     )
 
-    crew = Crew(agents=[agent], tasks=[task], process=Process.sequential)
-    
-    result_str = crew.kickoff()
-    try:
-        clean_json = str(result_str).replace('```json', '').replace('```', '').strip()
-        return json.loads(clean_json)
-    except Exception as e:
-        return {"error": "Failed to parse JSON", "raw_output": str(result_str), "details": str(e)}
 
-
-def run_doubt_resolver(student_profile: dict, task_input: str, retrieved_context: list = None) -> dict:
-    llm = get_creative_llm()
-    prompt = build_agent_prompt_with_student(DOUBT_RESOLVER_PROMPT, student_profile)
-    
-    context_str = "No specific RAG context provided for this query."
-    if retrieved_context:
-        context_str = "\n".join([str(c) for c in retrieved_context])
-
-    agent = Agent(
-        role="Doubt Resolver",
-        goal="Resolve student questions, explain concepts, and correct misconceptions using providing context.",
-        backstory=prompt,
-        verbose=True,
-        allow_delegation=False,
-        llm=llm
+def run_quiz_generator(student_profile: dict, task_input: str) -> dict[str, Any]:
+    return _run_agent(
+        "Quiz Generator",
+        "Create a quiz that measures mastery and surfaces misconceptions.",
+        build_agent_prompt_with_student(QUIZ_GENERATOR_PROMPT, student_profile),
+        f"Generate a quiz for this request: '{task_input}', following Bloom's Taxonomy.",
+        "reasoning",
     )
 
-    task = Task(
-        description=f"Resolve the following student doubt: '{task_input}'. \n\nUtilize this retrieved curriculum context: \n{context_str}\n\nReturn EXACTLY the specified JSON output format with no markdown blocks.",
-        expected_output="A valid JSON object.",
-        agent=agent
-    )
 
-    crew = Crew(agents=[agent], tasks=[task], process=Process.sequential)
-    
-    result_str = crew.kickoff()
-    try:
-        clean_json = str(result_str).replace('```json', '').replace('```', '').strip()
-        return json.loads(clean_json)
-    except Exception as e:
-        return {"error": "Failed to parse JSON", "raw_output": str(result_str), "details": str(e)}
+def run_doubt_resolver(
+    student_profile: dict, task_input: str, retrieved_context: list | None = None
+) -> dict[str, Any]:
+    context = (
+        "\n".join(str(c) for c in retrieved_context)
+        if retrieved_context
+        else "No curriculum context provided."
+    )
+    return _run_agent(
+        "Doubt Resolver",
+        "Resolve the student's question using the provided curriculum context.",
+        build_agent_prompt_with_student(DOUBT_RESOLVER_PROMPT, student_profile),
+        f"Resolve this doubt: '{task_input}'.\n\nCurriculum context:\n{context}",
+        "creative",
+    )

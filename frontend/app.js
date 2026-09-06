@@ -1,75 +1,95 @@
-const chatForm = document.getElementById('chat-form');
-const taskInput = document.getElementById('task-input');
-const chatContainer = document.getElementById('chat-container');
-const sendBtn = document.getElementById('send-btn');
+// Lumina dashboard.
+//
+// Two things the previous version got wrong. User task text was written into
+// the page with `<p>${text}</p>` -- unescaped -- so a student typing HTML (or
+// a model echoing it) had it rendered; only the JSON branch was escaped. And
+// the API base was the hardcoded `http://127.0.0.1:8000`, so the page worked
+// only when opened next to a dev server on that exact port. The page is served
+// by the API now, so requests are same-origin, and every value is escaped.
 
-// Student Profile inputs
-const sId = document.getElementById('student-id');
-const sName = document.getElementById('student-name');
-const grade = document.getElementById('grade-level');
-const age = document.getElementById('age');
-const styleSelect = document.getElementById('learning-style');
+const chatForm = document.getElementById("chat-form");
+const taskInput = document.getElementById("task-input");
+const chatContainer = document.getElementById("chat-container");
+const sendBtn = document.getElementById("send-btn");
+const apiKeyInput = document.getElementById("api-key");
 
-chatForm.addEventListener('submit', async (e) => {
+const sId = document.getElementById("student-id");
+const sName = document.getElementById("student-name");
+const grade = document.getElementById("grade-level");
+const age = document.getElementById("age");
+const styleSelect = document.getElementById("learning-style");
+
+const KEY_STORAGE = "lumina.apiKey";
+try {
+    if (apiKeyInput) apiKeyInput.value = sessionStorage.getItem(KEY_STORAGE) || "";
+} catch (e) { /* storage unavailable */ }
+apiKeyInput?.addEventListener("input", () => {
+    try { sessionStorage.setItem(KEY_STORAGE, apiKeyInput.value); } catch (e) { /* ignore */ }
+});
+
+function escapeHtml(value) {
+    return String(value ?? "")
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#039;");
+}
+
+chatForm.addEventListener("submit", async (e) => {
     e.preventDefault();
     const task = taskInput.value.trim();
-    if(!task) return;
+    if (!task) return;
 
-    // 1. Add User Message
-    addMessage(task, 'user');
-    taskInput.value = '';
+    addMessage(task, "user");
+    taskInput.value = "";
 
-    // 2. Add Loading Message
-    const loadId = 'msg-' + Date.now();
-    addMessage("EduPilot Orchestrator is generating<span class='loading-dots'></span>", 'system', loadId, 'EduPilot Orchestrator');
-    
-    // Disable input
+    const loadId = "msg-" + Date.now();
+    addMessage("Orchestrator is working…", "system", loadId, "Orchestrator");
     taskInput.disabled = true;
     sendBtn.disabled = true;
 
-    // 3. Make API Call to FastAPI
     try {
         const payload = {
-            task: task,
+            task,
             student: {
                 student_id: sId.value,
                 name: sName.value,
                 grade_level: grade.value,
-                age: parseInt(age.value),
+                age: parseInt(age.value, 10),
                 learning_style: styleSelect.value,
-                language: "English"
-            }
+                language: "English",
+            },
         };
 
-        const res = await fetch('http://127.0.0.1:8000/api/v1/tutor/solve', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
+        const res = await fetch("/api/v1/tutor/solve", {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "X-API-Key": apiKeyInput ? apiKeyInput.value : "" },
+            body: JSON.stringify(payload),
         });
 
-        const data = await res.json();
-        
-        // Remove loading
-        const loader = document.getElementById(loadId);
-        if(loader) loader.remove();
+        document.getElementById(loadId)?.remove();
 
-        if (data.status === 'success') {
-            // Format response as JSON string for display nicely
-            const responseText = typeof data.response === 'object' 
-                ? JSON.stringify(data.response, null, 2) 
+        let data = null;
+        try { data = await res.json(); } catch (err) { data = null; }
+
+        if (res.ok && data && data.status === "success") {
+            const responseText = typeof data.response === "object"
+                ? JSON.stringify(data.response, null, 2)
                 : data.response;
-            
-            // Reformat agent name for display
-            let displayAgent = data.agent_invoked.replace('_', ' ').replace(/\b\w/g, c => c.toUpperCase());
-            
-            addMessage(responseText, 'system', null, displayAgent, true);
+            const agent = String(data.agent_invoked || "agent").replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+            addMessage(responseText, "system", null, agent, true);
+        } else if (res.status === 401) {
+            addMessage("Not authorised. Enter the API key in the sidebar.", "system", null, "System");
         } else {
-            addMessage("An error occurred processing the task.", 'system');
+            const detail = data && data.detail;
+            const message = detail && typeof detail === "object" ? detail.message : (detail || "The task could not be processed.");
+            const requestId = detail && typeof detail === "object" ? detail.request_id : null;
+            addMessage(message + (requestId ? ` (ref ${requestId})` : ""), "system", null, "System");
         }
-
     } catch (err) {
         document.getElementById(loadId)?.remove();
-        addMessage(`Connection Error: Make sure main.py is running! (${err.message})`, 'system', null, 'System Error');
+        addMessage("Could not reach the API: " + err.message, "system", null, "System");
     } finally {
         taskInput.disabled = false;
         sendBtn.disabled = false;
@@ -78,47 +98,22 @@ chatForm.addEventListener('submit', async (e) => {
 });
 
 function addMessage(text, type, id = null, agent = null, isJson = false) {
-    const msgDiv = document.createElement('div');
+    const msgDiv = document.createElement("div");
     msgDiv.className = `message ${type}-message fade-in`;
-    if(id) msgDiv.id = id;
+    if (id) msgDiv.id = id;
 
-    const avatar = type === 'system' ? '🤖' : '👤';
-    const avatarClass = type === 'system' ? 'avatar-system' : 'avatar-user';
+    const avatar = type === "system" ? "🤖" : "👤";
+    const avatarClass = type === "system" ? "avatar-system" : "avatar-user";
 
-    let contentHtml = '';
-    
-    // Add agent pill for system answers
-    if (type === 'system' && agent) {
-        contentHtml += `<span class="agent-tag">${agent}</span>`;
+    let contentHtml = "";
+    if (type === "system" && agent) {
+        contentHtml += `<span class="agent-tag">${escapeHtml(agent)}</span>`;
     }
+    // Both branches escape: the transcript is untrusted, and so is a model
+    // reply that a student's task could have shaped.
+    contentHtml += isJson ? `<pre>${escapeHtml(text)}</pre>` : `<p>${escapeHtml(text)}</p>`;
 
-    if (isJson) {
-        contentHtml += `<pre>${escapeHtml(text)}</pre>`;
-    } else {
-        contentHtml += `<p>${text}</p>`;
-    }
-
-    msgDiv.innerHTML = `
-        <div class="${avatarClass}">${avatar}</div>
-        <div class="bubble">
-            ${contentHtml}
-        </div>
-    `;
-
+    msgDiv.innerHTML = `<div class="${avatarClass}">${avatar}</div><div class="bubble">${contentHtml}</div>`;
     chatContainer.appendChild(msgDiv);
-    // Smooth scroll
-    chatContainer.scrollTo({
-        top: chatContainer.scrollHeight,
-        behavior: 'smooth'
-    });
-}
-
-function escapeHtml(unsafe) {
-    if(!unsafe) return "";
-    return unsafe
-         .replace(/&/g, "&amp;")
-         .replace(/</g, "&lt;")
-         .replace(/>/g, "&gt;")
-         .replace(/"/g, "&quot;")
-         .replace(/'/g, "&#039;");
+    chatContainer.scrollTo({ top: chatContainer.scrollHeight, behavior: "smooth" });
 }
